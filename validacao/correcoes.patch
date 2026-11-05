@@ -1,0 +1,182 @@
+--- a/pipeline/dagster_radar/definitions.py
++++ b/pipeline/dagster_radar/definitions.py
+@@ -28,23 +28,13 @@
+     context.add_output_metadata({"pasta": bruto_dir(ref), "arquivos_no_manifesto": len(arqs), "zips": len(zips), "licenca": m.get("licenca") or "não registrada", "fonte_url": m.get("fonte_url") or m.get("url")})
+     return {"ref": ref, "pasta": bruto_dir(ref), "arquivos": len(arqs)}
+ 
+-@asset_check(asset=rfb_cnpj_bruto, description="Todo arquivo de dados do bruto tem sha256 no manifesto e os arquivos até 150 MB batem.")
++@asset_check(blocking=True, asset=rfb_cnpj_bruto, description="Todos os arquivos manifestados existem e têm SHA-256 válido, inclusive arquivos grandes; dados extras são detectados.")
+ def bruto_hash_confere(context, rfb_cnpj_bruto):
+     rfb_cnpj_bruto = da_particao(rfb_cnpj_bruto, context)
+-    ref = rfb_cnpj_bruto["ref"]; d = bruto_dir(ref); m = manifesto(ref); ok = bad = pul = 0; sem = []
+-    disco = {os.path.relpath(os.path.join(dp, f), d) for dp, _, fn in os.walk(d) for f in fn if not f.endswith((".json", ".md"))}
+-    man = {a["arquivo"]: a for a in m.get("arquivos", []) if a.get("arquivo")}
+-    for rel in sorted(disco):
+-        a = man.get(rel)
+-        if not a or not a.get("sha256"): sem.append(rel); continue
+-        p = os.path.join(d, rel)
+-        if os.path.getsize(p) > 150e6: pul += 1; continue
+-        h = hashlib.sha256()
+-        with open(p, "rb") as f:
+-            for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+-        if h.hexdigest() == a["sha256"]: ok += 1
+-        else: bad += 1
+-    return AssetCheckResult(passed=(bad == 0 and not sem), metadata={"conferidos_ok": ok, "divergentes": bad, "grandes_nao_conferidos": pul, "sem_hash": sem[:20]})
++    from integridade import verificar_manifesto
++    resultado = verificar_manifesto(bruto_dir(rfb_cnpj_bruto["ref"]))
++    return AssetCheckResult(passed=resultado["ok"], metadata=resultado)
++
+ 
+ # ---------------------------------------------------------------- tratados
+ @asset(partitions_def=REFS, group_name="tratados", deps=[rfb_cnpj_bruto], description="Estabelecimentos tipados, sem contato (telefone, e-mail, endereço não entram), particionados por referência. Chave: cnpj de 14 dígitos como texto.")
+@@ -67,7 +57,7 @@
+     context.add_output_metadata({"linhas": n, "rejeitadas": rej, "saida": out})
+     return {"ref": ref, "caminho": f"{out}/estabelecimento.parquet", "linhas": n, "rejeitadas": rej}
+ 
+-@asset_check(asset=estabelecimento, description="Domínios fechados: 27 UFs + EX; situação em {01,02,03,04,08}; CNPJ com 14 dígitos; nenhuma coluna de contato.")
++@asset_check(blocking=True, asset=estabelecimento, description="Domínios fechados: 27 UFs + EX; situação em {01,02,03,04,08}; CNPJ com 14 dígitos; nenhuma coluna de contato.")
+ def estabelecimento_dominios(context, estabelecimento):
+     estabelecimento = da_particao(estabelecimento, context)
+     p = estabelecimento["caminho"]; con = duckdb.connect()
+@@ -81,13 +71,13 @@
+     passed = ufs <= UF and sit <= {"01","02","03","04","08"} and cnpj_ruim == 0 and not contato and taxa <= 0.0001
+     return AssetCheckResult(passed=passed, metadata={"ufs_fora": sorted(ufs - UF), "situacoes": sorted(sit), "cnpj_com_tamanho_errado": cnpj_ruim, "colunas_de_contato": contato, "rejeitadas": rej, "taxa_rejeicao_pct": round(100 * taxa, 5)})
+ 
+-@asset_check(asset=estabelecimento, description="Chave única: cada CNPJ de 14 dígitos aparece uma vez.")
++@asset_check(blocking=True, asset=estabelecimento, description="Chave única: cada CNPJ de 14 dígitos aparece uma vez.")
+ def estabelecimento_chave_unica(context, estabelecimento):
+     estabelecimento = da_particao(estabelecimento, context)
+     n, d = duckdb.connect().execute(f"select count(*), count(distinct cnpj) from read_parquet('{estabelecimento['caminho']}')").fetchone()
+     return AssetCheckResult(passed=(n == d), metadata={"linhas": n, "cnpj_distintos": d})
+ 
+-@asset_check(asset=estabelecimento, description="Contagem total entre 90 % e 110 % da referência anterior (quando houver).")
++@asset_check(blocking=True, asset=estabelecimento, description="Contagem total entre 90 % e 110 % da referência anterior (quando houver).")
+ def estabelecimento_variacao(context, estabelecimento):
+     estabelecimento = da_particao(estabelecimento, context)
+     ref = estabelecimento["ref"]; y, m = map(int, ref.split("-")); ant = f"{y - (m == 1)}-{(m - 2) % 12 + 1:02d}"
+@@ -107,7 +97,7 @@
+     context.add_output_metadata({"estabelecimentos": int(tot), "saida": out})
+     return {"ref": ref, "estabelecimentos": int(tot), "tratado_linhas": estabelecimento["linhas"]}
+ 
+-@asset_check(asset=agregado_uf_divisao, description="A soma do agregado é igual ao total de estabelecimentos tratados (nada se perde no caminho).")
++@asset_check(blocking=True, asset=agregado_uf_divisao, description="A soma do agregado é igual ao total de estabelecimentos tratados (nada se perde no caminho).")
+ def agregado_fecha(context, agregado_uf_divisao):
+     agregado_uf_divisao = da_particao(agregado_uf_divisao, context)
+     return AssetCheckResult(passed=agregado_uf_divisao["estabelecimentos"] == agregado_uf_divisao["tratado_linhas"], metadata={"agregado": agregado_uf_divisao["estabelecimentos"], "tratado": agregado_uf_divisao["tratado_linhas"]})
+--- a/pipeline/dagster_radar/entidades.py
++++ b/pipeline/dagster_radar/entidades.py
+@@ -124,15 +124,15 @@
+         context.add_output_metadata({"linhas": n, "rejeitadas": rej, "saida": out, "simples_com_mei": mei})
+         return {"ref": ref, "caminho": f"{out}/empresa.parquet", "linhas": n, "rejeitadas": rej}
+ 
+-    @asset_check(asset=empresa, description="Chave única (cnpj_basico) e porte no domínio.")
++    @asset_check(blocking=True, asset=empresa, description="Chave única (cnpj_basico) e porte no domínio.")
+     def empresa_chave_unica(context):
+         return chk_empresa_chave_unica(particao(context))
+ 
+-    @asset_check(asset=empresa, description="Sem dado pessoal: nenhuma razão social de natureza de pessoa física sem máscara e nenhuma com 11 dígitos no fim.")
++    @asset_check(blocking=True, asset=empresa, description="Sem dado pessoal: nenhuma razão social de natureza de pessoa física sem máscara e nenhuma com 11 dígitos no fim.")
+     def empresa_sem_dado_pessoal(context):
+         return chk_empresa_sem_dado_pessoal(particao(context))
+ 
+-    @asset_check(asset=empresa, description="Cobertura: toda raiz de estabelecimento existe em empresa (órfãs ≤ 0,01 %).")
++    @asset_check(blocking=True, asset=empresa, description="Cobertura: toda raiz de estabelecimento existe em empresa (órfãs ≤ 0,01 %).")
+     def empresa_cobre_estabelecimentos(context):
+         return chk_empresa_cobre_estabelecimentos(particao(context))
+ 
+@@ -153,7 +153,7 @@
+     context.add_output_metadata({"linhas": n, "anos": anos, "saida": out})
+     return {"ref": REGIME_REF, "caminho": f"{out}/regime.parquet", "linhas": n}
+ 
+-@asset_check(asset=regime, description="Chave única cnpj_basico + ano e anos entre 2016 e 2024.")
++@asset_check(blocking=True, asset=regime, description="Chave única cnpj_basico + ano e anos entre 2016 e 2024.")
+ def regime_chave_unica(regime):
+     con = conexao(); n, d, mi, ma = con.execute(f"select count(*), count(distinct cnpj_basico || ano), min(ano), max(ano) from read_parquet('{regime['caminho']}')").fetchone()
+     return AssetCheckResult(passed=(n == d and mi >= 2016 and ma <= 2024), metadata={"linhas": n, "distintas": d, "ano_min": mi, "ano_max": ma})
+@@ -194,7 +194,7 @@
+         context.add_output_metadata({"vinculos": n, "empresas": emp, "socios_pj": pj, "estrangeiros": estr, "saida": out})
+         return {"ref": ref, "caminho": f"{out}/socio_vinculo.parquet", "linhas": n}
+ 
+-    @asset_check(asset=socio_vinculo, description="Sem coluna de nome ou CPF; tipo no domínio; chave única cnpj_basico + seq.")
++    @asset_check(blocking=True, asset=socio_vinculo, description="Sem coluna de nome ou CPF; tipo no domínio; chave única cnpj_basico + seq.")
+     def socio_sem_dado_pessoal(context):
+         return chk_socio_sem_dado_pessoal(particao(context))
+ 
+@@ -242,7 +242,7 @@
+         context.add_output_metadata({"empresas": int(n), "estabelecimentos": int(soma), "com_socios": tem_socios, "saida": out})
+         return {"ref": ref, "caminho": f"{out}/indice.parquet", "empresas": int(n), "estabelecimentos": int(soma), "tratado_linhas": empresa.get("linhas") if isinstance(empresa, dict) else None}
+ 
+-    @asset_check(asset=indice_empresas, description="Uma linha por raiz; a soma de estabelecimentos do índice é igual ao tratado da referência.")
++    @asset_check(blocking=True, asset=indice_empresas, description="Uma linha por raiz; a soma de estabelecimentos do índice é igual ao tratado da referência.")
+     def indice_fecha(context):
+         return chk_indice_fecha(particao(context))
+ 
+@@ -271,7 +271,7 @@
+         context.add_output_metadata({"novas": novas, "saidas": saidas, "mudancas": mud, "empresas_com_mudanca": emp_mud, "saida": out})
+         return {"ref": ref, "anterior": ant, "empresas_anterior": na, "empresas_atual": nb, "novas": novas, "saidas": saidas, "mudancas": mud}
+ 
+-    @asset_check(asset=diff_empresas, description="Fecha: empresas anteriores + novas − saídas = empresas atuais.")
++    @asset_check(blocking=True, asset=diff_empresas, description="Fecha: empresas anteriores + novas − saídas = empresas atuais.")
+     def diff_fecha(context):
+         return chk_diff_fecha(particao(context))
+ 
+@@ -298,7 +298,7 @@
+         context.add_output_metadata({"empresas": n, "tokens": t, "saida": db})
+         return {"ref": ref, "caminho": db, "empresas": n, "tokens": t}
+ 
+-    @asset_check(asset=busca, description="A busca responde: raiz de caso-ouro encontrada por CNPJ e por palavra do nome; contagem do índice igual à do Parquet.")
++    @asset_check(blocking=True, asset=busca, description="A busca responde: raiz de caso-ouro encontrada por CNPJ e por palavra do nome; contagem do índice igual à do Parquet.")
+     def busca_responde(context):
+         return chk_busca_responde(particao(context))
+ 
+--- a/pipeline/dagster_radar/apipj.py
++++ b/pipeline/dagster_radar/apipj.py
+@@ -37,7 +37,7 @@
+     return {"pastas": pastas, "cnpjs_total": total_cnpjs}
+ 
+ 
+-@asset_check(asset=apipj_bruto, description="Todo arquivo listado no manifesto de cada pasta apipj-* existe e o sha256 bate.")
++@asset_check(blocking=True, asset=apipj_bruto, description="Todo arquivo listado no manifesto de cada pasta apipj-* existe e o sha256 bate.")
+ def apipj_bruto_hash_confere(context, apipj_bruto):
+     ok = bad = sem = 0
+     for pasta in apipj_bruto["pastas"]:
+@@ -94,7 +94,7 @@
+     return {"caminho": f"{out}/apipj_tratado.parquet", "linhas": n}
+ 
+ 
+-@asset_check(asset=apipj_tratado, description="Cada CNPJ consultado com sucesso aparece uma vez.")
++@asset_check(blocking=True, asset=apipj_tratado, description="Cada CNPJ consultado com sucesso aparece uma vez.")
+ def apipj_tratado_chave_unica(context, apipj_tratado):
+     n, d = duckdb.connect().execute(f"select count(*), count(distinct cnpj) from read_parquet('{apipj_tratado['caminho']}')").fetchone()
+     return AssetCheckResult(passed=(n == d), metadata={"linhas": n, "cnpj_distintos": d})
+@@ -124,7 +124,7 @@
+     return reg
+ 
+ 
+-@asset_check(asset=apipj_cobertura, description="A camada pronta nunca guarda registro por CNPJ (só contagem) — respeita os termos da ApiPJ contra reconstrução/espelhamento em massa.")
++@asset_check(blocking=True, asset=apipj_cobertura, description="A camada pronta nunca guarda registro por CNPJ (só contagem) — respeita os termos da ApiPJ contra reconstrução/espelhamento em massa.")
+ def apipj_cobertura_sem_registro_individual(context, apipj_cobertura):
+     caminho = f"{DADOS}/prontos/apipj_cobertura/cobertura.json"
+     txt = open(caminho, encoding="utf-8").read()
+--- a/pipeline/vigia/baixar.py
++++ b/pipeline/vigia/baixar.py
+@@ -16,6 +16,7 @@
+ Uso: chamado pelo vigia.py depois de gravar o estado (rodar()). À mão: baixar.py [pncp|ceis-cnep|pgfn ...]
+ Teste sem tocar no acervo: baixar.py pncp-teste AAAAMMDD AAAAMMDD <pasta-de-teste>
+ Feito por torito (skill paolo)."""
++import tempfile
+ import calendar, csv, datetime, fcntl, gzip, hashlib, io, json, os, re, shutil, sys, time, urllib.error, urllib.request, zipfile
+ 
+ DADOS = os.environ.get("RADAR_DADOS", "/srv/tributario/dados")
+@@ -110,9 +111,8 @@
+ 
+ 
+ def novo_tmp(pasta):
+-    tmp = f"{BRUTOS}/_tmp-{pasta}"
+-    if os.path.exists(tmp):            # sobra de uma tentativa interrompida deste mesmo baixador
+-        shutil.rmtree(tmp)
++    os.makedirs(BRUTOS, exist_ok=True)
++    tmp = tempfile.mkdtemp(prefix=f"_tmp-{pasta}-", dir=BRUTOS)
+     os.makedirs(f"{tmp}/raw")
+     return tmp
+ 
